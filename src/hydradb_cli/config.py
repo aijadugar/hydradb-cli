@@ -13,6 +13,7 @@ its canonical replacement. The canonical name wins when both are set.
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 # Canonical environment variable names (CONTRACT §1).
@@ -110,16 +111,25 @@ def _read_config_file() -> dict:
 
 def _write_config_file(data: dict) -> None:
     _ensure_config_dir()
-    # Write to a sibling temp file created 0600 from the start (no window where the
-    # API key is world-readable), then atomically replace so an interrupted write
-    # can never leave a truncated config behind.
-    tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + f".{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # ``mkstemp`` gives an unpredictable name, opens with O_EXCL (so a planted
+    # file or symlink at that path can never be written through) and creates it
+    # 0600 from the start — no window where the API key is world-readable. Then
+    # ``os.replace`` swaps it in atomically so an interrupted write can never
+    # leave a truncated config behind.
+    fd, tmp_name = tempfile.mkstemp(dir=CONFIG_DIR, prefix=".config.", suffix=".tmp")
+    tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1  # fdopen owns the descriptor from here on
             fh.write(json.dumps(data, indent=2) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, CONFIG_FILE)
     except BaseException:
+        # On any failure, close the handle (if fdopen never took it) and remove
+        # the temp file, so a failed save leaves nothing behind.
+        if fd != -1:
+            os.close(fd)
         tmp.unlink(missing_ok=True)
         raise
 
