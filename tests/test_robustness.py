@@ -48,6 +48,65 @@ def test_config_written_0600_atomically(cfg):
     assert [p.name for p in cfg.parent.iterdir()] == ["config.json"]  # no temp file left
 
 
+def test_a_failed_replace_leaves_the_old_config_and_no_temp_file(cfg, monkeypatch):
+    """Atomicity is only real if a failure rolls back and cleans up.
+
+    A partially written config would lose the API key; a leftover temp file
+    would sit in the config directory holding a copy of it.
+    """
+    original = b'{"api_key": "sk-old", "database": "db"}\n'
+    cfg.write_bytes(original)
+    captured = {}
+
+    def boom(src, dst):
+        captured["src"] = str(src)
+        if os.name != "nt":
+            captured["mode"] = stat.S_IMODE(os.stat(src).st_mode)
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        config.save_config(api_key="sk-new")
+
+    assert cfg.read_bytes() == original
+    assert config.get_api_key() == "sk-old"
+    assert list(cfg.parent.glob(".config.*.tmp")) == []
+    if os.name != "nt":
+        # The temp file was 0600 from creation, never 0666-then-chmod.
+        assert captured["mode"] == 0o600
+
+
+def test_a_file_at_the_old_predictable_temp_path_is_never_written_through(cfg):
+    """The temp name must be unpredictable, not ``config.json.<pid>.tmp``.
+
+    A file planted there (or a symlink pointing elsewhere) would otherwise be
+    truncated and then moved over the real config.
+    """
+    cfg.write_text(json.dumps({"api_key": "sk-old"}))
+    stale = cfg.with_name(f"{cfg.name}.{os.getpid()}.tmp")
+    stale.write_text("untouched")
+
+    config.save_config(api_key="sk-new")
+
+    assert stale.read_text() == "untouched"
+    assert config.get_api_key() == "sk-new"
+
+
+def test_a_symlink_in_the_config_dir_is_never_written_through(cfg, tmp_path):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("original")
+    link = cfg.parent / ".config.symlink.tmp"
+    try:
+        link.symlink_to(victim)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not available on this platform")
+
+    config.save_config(api_key="sk-new")
+
+    assert victim.read_text() == "original"
+    assert config.get_api_key() == "sk-new"
+
+
 @pytest.mark.parametrize("n", [1, 8, 13, 16, 20, 40])
 def test_mask_never_reveals_most_of_key(n):
     key = "".join(chr(65 + i % 26) for i in range(n))
@@ -70,6 +129,21 @@ def test_explicit_stdin_waits_for_slow_producer():
     time.sleep(0.6)
     out, _ = proc.communicate("late data\n", timeout=10)
     assert out.strip() == "late data"
+
+
+def test_explicit_stdin_invalid_utf8_is_a_clean_error():
+    """Invalid bytes on stdin must produce the CLI's error, not a traceback."""
+    proc = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "hydradb_cli.main", "ingest", "--text", "-"],
+        input=b"\xff\xfe\x00bad",
+        capture_output=True,
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        timeout=60,
+    )
+    output = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+    assert proc.returncode != 0
+    assert "Could not read stdin" in output
+    assert "Traceback" not in output
 
 
 def _resp(status, **kw):
