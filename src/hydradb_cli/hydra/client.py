@@ -223,15 +223,10 @@ class _Databases(_Resource):
         except httpx.HTTPError as exc:
             raise translate_sdk_error(exc) from exc
 
-        try:
-            body = response.json() if response.content else None
-        except ValueError:
-            body = response.text or None
-
-        if response.is_error:
-            # Same message extraction the SDK and BYOG paths use, so a 404 from
-            # the delete tombstone surfaces the API's own wording.
-            raise HydraDBClientError(response.status_code, _stringify_body(body))
+        # The same response gate the SDK and BYOG paths use: 3xx and non-JSON
+        # 2xx are errors, so a redirect or a captive-portal page can never be
+        # mistaken for a successful deletion. An empty body is still valid.
+        body = _checked_body(response)
 
         return _unwrap_payload(body) or {}
 
@@ -618,18 +613,11 @@ class _Graph(_Resource):
         except httpx.HTTPError as exc:
             raise translate_sdk_error(exc) from exc
 
-        try:
-            body = response.json() if response.content else None
-        except ValueError:
-            body = response.text or None
-
-        if response.is_error:
-            # Route through the same message extraction the SDK path uses, so a
-            # rejected Cypher query surfaces the compiler's own feedback rather
-            # than a bare status code.
-            raise HydraDBClientError(response.status_code, _stringify_body(body))
-
-        return _unwrap_payload(body)
+        # Route through the same response gate the SDK path uses, so a rejected
+        # Cypher query surfaces the compiler's own feedback rather than a bare
+        # status code, and a redirect or non-JSON 2xx is an error rather than an
+        # empty result. ``/byog/query`` returns a list, which passes through.
+        return _unwrap_payload(_checked_body(response))
 
     def query(
         self,
